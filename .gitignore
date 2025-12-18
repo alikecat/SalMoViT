@@ -1,0 +1,12 @@
+Results/
+Weights/
+Documents/
+__pycache__/
+venv/
+.venv/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+run.sh
