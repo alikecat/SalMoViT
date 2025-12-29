@@ -295,19 +295,16 @@ def _prepare_data_loader(cfg: HyperConfigs, dataset, is_validation=False):
     )
 
 
-def _save_results(cfg: HyperConfigs, valid_scores):
+def _save_results(cfg: HyperConfigs, df_metrics):
     index_columns = ["EPOCH", "LR", "DATASET"]
     if cfg.command == "cv":
         index_columns = ["FOLD", *index_columns]
-    metric_names = ["NUM", "IG", "NSS", "AUC", "SAUC", "CC", "KLD", "SIM"]
-    columns = [*index_columns, *metric_names][: len(valid_scores[0])]
-    result = pd.DataFrame(valid_scores, columns=columns)
     cfg.save_time = time.strftime("%Y%m%d_%H%M%S")
     cfg.result_dir.mkdir(parents=True, exist_ok=True)
     output_path = cfg.result_dir.joinpath(f"{cfg.command}_{cfg.start_time}")
     with open(output_path.with_suffix(".json"), "w") as f:
         json.dump(asdict(cfg), f, indent=4, default=str)
-    result.to_csv(output_path.with_suffix(".csv"), index=False)
+    df_metrics.to_csv(output_path.with_suffix(".csv"), index=False)
     print(f"💾 Saved result to {output_path.with_suffix('.csv')}")
 
 
@@ -317,55 +314,63 @@ def _run_training_loop(
     trainer = _create_trainer(cfg)
     best_info = None
     max_name_len = np.max([len(name) for name in valid_components.keys()])
+    metric_names = ["IG", "NSS", "AUC", "SAUC", "CC", "KLD", "SIM"]
+    all_metrics = []
     early_stop_counter = 0
     for epoch in range(cfg.epochs):
         lr = trainer.optimizer.param_groups[0]["lr"]
         trainer.model.train()
-        ig = trainer.train_epoch(
+        trainer.train_epoch(
             train_loader, f"🔥 Epoch {epoch + 1:{len(str(cfg.epochs))}d}/{cfg.epochs}"
         )
-        score = [epoch + 1, lr, "train", len(train_loader), ig] + [None] * 6
-        epoch_scores = [[fold_idx, *score]] if fold_idx else [score]
         if valid_components and (cfg.validate_all_epochs or epoch == cfg.epochs - 1):
             with torch.no_grad():
                 trainer.model.eval()
+                epoch_metrics = []
                 for name, valid_component in valid_components.items():
                     desc = f"✅ Epoch {epoch + 1:{len(str(cfg.epochs))}d}/{cfg.epochs} @ {name:<{max_name_len}}"
-                    metrics = trainer.valid_epoch(
-                        valid_component, desc, cfg.quick_valid
+                    metrics_df = pd.DataFrame(
+                        trainer.valid_epoch(valid_component, desc, cfg.quick_valid),
+                        columns=metric_names,
                     )
-                    num = len(valid_component[0])
-                    score = [epoch + 1, lr, f"val_{name}", num, *metrics]
-                    epoch_scores.append(score)
+                    metrics_df["Epoch"] = epoch + 1
+                    metrics_df["LR"] = lr
+                    metrics_df["Dataset"] = name
+                    epoch_metrics.append(metrics_df)
+                epoch_metrics = pd.concat(epoch_metrics, ignore_index=True)
+                all_metrics.append(epoch_metrics)
                 if len(valid_components) > 1:
-                    num = sum([score[3] for score in epoch_scores[1:]])
-                    metric_names = ["IG", "NSS", "AUC", "SAUC", "CC", "KLD", "SIM"]
-                    metrics = np.mean([score[4:] for score in epoch_scores[1:]], 0)
-                    score = [epoch + 1, lr, "val_DS-Avg", num, *metrics]
-                    epoch_scores.append(score)
-                    metric_names = ["IG", "NSS", "AUC", "SAUC", "CC", "KLD", "SIM"]
-                    metrics_str = ", ".join(
-                        [f"{k.upper()}={v:.3f}" for k, v in zip(metric_names, metrics)]
+                    ds_stats = epoch_metrics.groupby("Dataset")[metric_names].agg(
+                        ["mean", "std"]
                     )
+                    ds_avg_mean = ds_stats.xs("mean", axis=1, level=1).mean().values
+                    ds_avg_std = ds_stats.xs("std", axis=1, level=1).mean().values
+                    img_avg_mean = epoch_metrics[metric_names].mean().values
+                    img_avg_std = epoch_metrics[metric_names].std().values
                     desc = f"✅ Epoch {epoch + 1:{len(str(cfg.epochs))}d}/{cfg.epochs} @ {'DS_Avg':<{max_name_len}}"
-                    print(f"{desc}          NUM={num:>4}, {metrics_str}")
-                    weighted_metrics = [
-                        np.array(score[4:]) * score[3] for score in epoch_scores[1:-1]
-                    ]
-                    metrics = np.sum(weighted_metrics, 0) / num
-                    score = [epoch + 1, lr, "val_Img-Avg", num, *metrics]
-                    epoch_scores.append(score)
                     metrics_str = ", ".join(
-                        [f"{k.upper()}={v:.3f}" for k, v in zip(metric_names, metrics)]
+                        [
+                            f"{k.upper()}={v:.3f}±{s:.3f}"
+                            for k, v, s in zip(metric_names, ds_avg_mean, ds_avg_std)
+                        ]
+                    )
+                    print(
+                        f"{desc}          NUM={epoch_metrics.shape[0]:>4}, {metrics_str}"
+                    )
+                    metrics_str = ", ".join(
+                        [
+                            f"{k.upper()}={v:.3f}±{s:.3f}"
+                            for k, v, s in zip(metric_names, img_avg_mean, img_avg_std)
+                        ]
                     )
                     desc = f"✅ Epoch {epoch + 1:{len(str(cfg.epochs))}d}/{cfg.epochs} @ {'Img_Avg':<{max_name_len}}"
-                    print(f"{desc}          NUM={num:>4}, {metrics_str}")
-                results.extend(
-                    [[fold_idx, *score] for score in epoch_scores]
-                    if fold_idx
-                    else epoch_scores
-                )
-                _save_results(cfg, results)
+                    print(
+                        f"{desc}          NUM={epoch_metrics.shape[0]:>4}, {metrics_str}"
+                    )
+                all_metrics_df = pd.concat(all_metrics, ignore_index=True)
+                if fold_idx:
+                    all_metrics_df["Fold"] = fold_idx
+                _save_results(cfg, all_metrics_df)
                 cfg.weight_dir.mkdir(parents=True, exist_ok=True)
                 weight_name = f"{cfg.command}_{cfg.start_time}"
                 if fold_idx:
@@ -373,7 +378,7 @@ def _run_training_loop(
                 weight_path = cfg.weight_dir.joinpath(weight_name).with_suffix(".pth")
                 if cfg.scheduler_type == SchedulerType.plateau:
                     current_lr = trainer.optimizer.param_groups[0]["lr"]
-                    trainer.scheduler.step(metrics[0])
+                    trainer.scheduler.step(img_avg_mean[0])
                     if trainer.optimizer.param_groups[0]["lr"] != current_lr:
                         print(
                             f"📉 Learning rate reduced from {current_lr:.2e} to {trainer.optimizer.param_groups[0]['lr']:.2e}"
@@ -383,10 +388,10 @@ def _run_training_loop(
                         )
                 else:
                     trainer.scheduler.step()
-                if best_info is None or metrics[0] > best_info["metrics"][0]:
+                if best_info is None or img_avg_mean[0] > best_info["metrics"][0]:
                     best_info = {
                         "fold_idx": fold_idx,
-                        "metrics": metrics,
+                        "metrics": img_avg_mean,
                         "epoch": epoch + 1,
                     }
                     early_stop_counter = 0
@@ -568,43 +573,50 @@ def validate_models(
             valid_components[name][2],
         )
     max_name_len = np.max([len(name) for name in valid_components.keys()])
-    scores = []
+    metric_names = ["IG", "NSS", "AUC", "SAUC", "CC", "KLD", "SIM"]
+    all_metrics = []
     for model in models:
         trainer = _create_trainer(cfg, model.get_model())
         print(f"🔄 Switching to model: {model.name}")
         with torch.no_grad():
             trainer.model.eval()
-            model_scores = []
+            model_metrics = []
             for name, valid_component in valid_components.items():
                 desc = f"✅ {name:<{max_name_len}}"
-                metrics = trainer.valid_epoch(valid_component, desc, cfg.quick_valid)
-                num = len(valid_component[0])
-                score = [model.name, None, f"val_{name}", num, *metrics]
-                model_scores.append(score)
-            if len(valid_components) > 1:
-                metric_names = ["IG", "NSS", "AUC", "SAUC", "CC", "KLD", "SIM"]
-                num = sum([score[3] for score in model_scores])
-                metrics = np.mean([score[4:] for score in model_scores], 0)
-                score = [model.name, None, "val_DS_Avg", num, *metrics]
-                model_scores.append(score)
-                metrics_str = ", ".join(
-                    [f"{k.upper()}={v:.3f}" for k, v in zip(metric_names, metrics)]
+                metrics_df = pd.DataFrame(
+                    trainer.valid_epoch(valid_component, desc, cfg.quick_valid),
+                    columns=metric_names,
                 )
+                metrics_df["Model"] = model.name
+                metrics_df["Dataset"] = name
+                model_metrics.append(metrics_df)
+            model_metrics = pd.concat(model_metrics, ignore_index=True)
+            all_metrics.append(model_metrics)
+            if len(valid_components) > 1:
+                ds_stats = model_metrics.groupby("Dataset")[metric_names].agg(
+                    ["mean", "std"]
+                )
+                ds_avg_mean = ds_stats.xs("mean", axis=1, level=1).mean().values
+                ds_avg_std = ds_stats.xs("std", axis=1, level=1).mean().values
+                img_avg_mean = model_metrics[metric_names].mean().values
+                img_avg_std = model_metrics[metric_names].std().values
                 desc = f"✅ {'DS_Avg':<{max_name_len}}"
-                print(f"{desc}          NUM={num:>4}, {metrics_str}")
-                weighted_metrics = [
-                    np.array(score[4:]) * score[3] for score in model_scores[:-1]
-                ]
-                metrics = np.sum(weighted_metrics, 0) / num
-                score = [model.name, None, "val_Img_Avg", num, *metrics]
-                model_scores.append(score)
                 metrics_str = ", ".join(
-                    [f"{k.upper()}={v:.3f}" for k, v in zip(metric_names, metrics)]
+                    [
+                        f"{k.upper()}={v:.3f}±{s:.3f}"
+                        for k, v, s in zip(metric_names, ds_avg_mean, ds_avg_std)
+                    ]
+                )
+                print(f"{desc}          NUM={model_metrics.shape[0]:>4}, {metrics_str}")
+                metrics_str = ", ".join(
+                    [
+                        f"{k.upper()}={v:.3f}±{s:.3f}"
+                        for k, v, s in zip(metric_names, img_avg_mean, img_avg_std)
+                    ]
                 )
                 desc = f"✅ {'Img_Avg':<{max_name_len}}"
-                print(f"{desc}          NUM={num:>4}, {metrics_str}")
-            scores.extend(model_scores)
-    _save_results(cfg, scores)
+                print(f"{desc}          NUM={model_metrics.shape[0]:>4}, {metrics_str}")
+    _save_results(cfg, pd.concat(all_metrics, ignore_index=True))
 
 
 @app.command("draw", help="draw attention maps")

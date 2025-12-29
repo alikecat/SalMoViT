@@ -187,10 +187,17 @@ class Trainer:
             duration = time.strftime(
                 "%H:%M:%S", time.gmtime(progress.tasks[task].elapsed)
             )
-            metrics = np.concatenate(metrics).mean(0).tolist()
+            metrics_array = np.concatenate(metrics)
             metric_names = ["IG", "NSS", "AUC", "SAUC", "CC", "KLD", "SIM"]
             metrics_str = ", ".join(
-                [f"{k.upper()}={v:.3f}" for k, v in zip(metric_names, metrics)]
+                [
+                    f"{k.upper()}={v:.3f}±{s:.3f}"
+                    for k, v, s in zip(
+                        metric_names,
+                        metrics_array.mean(0).tolist(),
+                        metrics_array.std(0).tolist(),
+                    )
+                ]
             )
             print(f"{desc}{duration}, NUM={len(valid_component[0]):>4}, {metrics_str}")
-        return metrics
+        return metrics_array
